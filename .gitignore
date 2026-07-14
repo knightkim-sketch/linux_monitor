@@ -1,0 +1,4 @@
+hosts.json
+.hosts.json.swp
+__pycache__/
+*.pyc
