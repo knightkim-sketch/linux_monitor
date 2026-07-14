@@ -52,3 +52,7 @@
 - 머신이 20대를 넘어가면 `POLL_INTERVAL` 을 늘려 부하를 낮추세요.
 - EDA 워크로드(Vivado/QuestaSim)가 메모리를 크게 먹는 머신은 memory 막대가
   빨강으로 먼저 뜨므로, 스와핑으로 머신이 멈추기 전에 미리 확인할 수 있습니다.
+
+## Sample View
+<img width="1860" height="848" alt="image" src="https://github.com/user-attachments/assets/f39d38e5-d123-454c-aa7f-7c829d52cee3" />
+
