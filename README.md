@@ -54,5 +54,8 @@
   빨강으로 먼저 뜨므로, 스와핑으로 머신이 멈추기 전에 미리 확인할 수 있습니다.
 
 ## Sample View
+- Sort by name
+<img width="1842" height="873" alt="image" src="https://github.com/user-attachments/assets/833a4674-83b7-40a2-921a-08b5a9033c5a" />
+- Sort most free first
 <img width="1860" height="848" alt="image" src="https://github.com/user-attachments/assets/f39d38e5-d123-454c-aa7f-7c829d52cee3" />
 
