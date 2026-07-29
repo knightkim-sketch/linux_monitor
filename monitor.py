@@ -41,6 +41,50 @@ POLL_INTERVAL = 5          # seconds between polling rounds
 SSH_TIMEOUT = 8            # per-connection timeout
 HISTORY_LEN = 60           # samples kept per host for the mini charts
 
+# Xilinx / Alveo card inventory, straight from sysfs — no root, no XRT tools needed.
+# An Alveo board shows up as two PCI functions on the same bus (mgmt .0 + user .1),
+# each exposing a subset of the fields, so we emit "bdf|key|value" lines and merge
+# them per bus on our side.  Cards with no driver bound (xclmgmt/xocl not loaded)
+# still report presence and PCIe link, just no telemetry.
+FPGA_CMD = (
+    'for d in /sys/bus/pci/devices/*; do '
+    '[ "$(cat $d/vendor 2>/dev/null)" = "0x10ee" ] || continue; '
+    'b=$(basename $d); '
+    'echo "$b|dev|$(cat $d/device 2>/dev/null)"; '
+    'echo "$b|drv|$(basename $(readlink $d/driver 2>/dev/null) 2>/dev/null)"; '
+    'for n in $d/hwmon/hwmon*/name; do [ -r "$n" ] && echo "$b|shell|$(cat $n)"; done; '
+    'for t in $d/xmc.*/xmc_fpga_temp; do [ -r "$t" ] && echo "$b|temp|$(cat $t)"; done; '
+    'for p in $d/xmc.*/xmc_power; do [ -r "$p" ] && echo "$b|power|$(cat $p)"; done; '
+    '[ -r $d/xclbinuuid ] && echo "$b|xclbin|$(cat $d/xclbinuuid)"; '
+    '[ -r $d/current_link_speed ] && echo "$b|lnk|$(cat $d/current_link_speed | tr -d \' \')'
+    'x$(cat $d/current_link_width 2>/dev/null)"; '
+    'done; '
+    # Prototyping boards (VPK180, S2C S8_40) expose an anonymous XDMA endpoint on
+    # PCIe — device 0xb054, identical subsystem ids on every board — so PCI cannot
+    # tell them apart.  Their USB JTAG/UART bridge carries the real model name and
+    # a per-unit serial, which is the only reliable discriminator.  Read it from
+    # sysfs, not lsusb: lsusb is broken on some hosts and can't resolve these ids.
+    'for u in /sys/bus/usb/devices/*; do '
+    'p=$(cat $u/product 2>/dev/null); [ -n "$p" ] || continue; '
+    'v=$(cat $u/idVendor 2>/dev/null); '
+    'case "$v" in 0403|fa2c|1443|03fd|10ee) ;; *) continue;; esac; '
+    'echo "usb|$v:$(cat $u/idProduct 2>/dev/null)|$(cat $u/manufacturer 2>/dev/null)'
+    '|$p|$(cat $u/serial 2>/dev/null)"; '
+    'done'
+)
+
+# USB product string -> the name the team actually uses for the board.
+USB_BOARD_ALIASES = {"H-LS-S8V40": "S8_40"}
+
+# Fallback model names for cards whose driver isn't loaded (no shell string to read).
+# Keyed by PCI device id; both the mgmt and user function id map to the same board.
+XILINX_MODELS = {
+    "0x5000": "U200", "0x5001": "U200",
+    "0x5004": "U250", "0x5005": "U250",
+    "0x5020": "U50",  "0x5021": "U50",
+    "0x505c": "U55C", "0x505d": "U55C",
+}
+
 # One remote command gathers everything in a single round trip.
 # We read /proc/stat twice with a short gap to compute CPU %, plus meminfo,
 # load average, cpu core count, and uptime.
@@ -56,7 +100,8 @@ REMOTE_CMD = (
     "echo ---; "
     "nproc; "
     "echo ---; "
-    "cat /proc/uptime"
+    "cat /proc/uptime; "
+    "echo ---; " + FPGA_CMD
 )
 
 # ---------------------------------------------------------------------------
@@ -89,6 +134,89 @@ def _parse_cpu_line(line):
     return total, idle
 
 
+def _parse_fpgas(block):
+    cards = {}
+    boards = []
+    for line in block.splitlines():
+        if line.startswith("usb|"):
+            f = (line.split("|") + ["", "", "", ""])[:5]
+            product, serial = f[3].strip(), f[4].strip()
+            if not product:
+                continue
+            # S2C reports its serial as "H-LS-S8V40(0c:5c:b5:60:58:33)" — the model
+            # name is already the label, so keep only the part that differs per unit
+            if serial.startswith(product + "(") and serial.endswith(")"):
+                serial = serial[len(product) + 1:-1]
+            boards.append({
+                "model": USB_BOARD_ALIASES.get(product, product),
+                "product": product, "vendor": f[2].strip(),
+                "usb_id": f[1].strip(), "serial": serial,
+            })
+            continue
+        parts = line.split("|", 2)
+        if len(parts) != 3:
+            continue
+        bdf, key, val = parts
+        val = val.strip()
+        if not val:
+            continue
+        bus = bdf.rsplit(":", 1)[0]          # 0000:01:00.1 -> 0000:01
+        c = cards.setdefault(bus, {
+            "bdf": bus, "model": None, "shell": None, "dev_id": None,
+            "driver": None, "temp_c": None, "power_w": None,
+            "link": None, "loaded": None, "serial": None, "alveo": False,
+        })
+        if key == "dev":
+            c["dev_id"] = val
+            if val.lower() in XILINX_MODELS:
+                c["alveo"] = True
+                if not c["model"]:
+                    c["model"] = XILINX_MODELS[val.lower()]
+        elif key == "drv":
+            # user PF (xocl) is the more informative of the two functions
+            c["driver"] = val if val == "xocl" else (c["driver"] or val)
+        elif key == "shell":
+            # xilinx_u250_gen3x16_xdma_shell_2_1_user -> u250_gen3x16_xdma_shell_2_1
+            s = val[7:] if val.startswith("xilinx_") else val
+            for suf in ("_mgmt", "_user"):
+                if s.endswith(suf):
+                    s = s[:-len(suf)]
+            c["shell"] = s
+            c["model"] = s.split("_")[0].upper()
+            c["alveo"] = True
+        elif key == "temp":
+            t = int(val)
+            c["temp_c"] = t if c["temp_c"] is None else max(c["temp_c"], t)
+        elif key == "power":
+            w = round(int(val) / 1e6, 1)     # microwatts -> W
+            c["power_w"] = w if c["power_w"] is None else max(c["power_w"], w)
+        elif key == "xclbin":
+            c["loaded"] = val.strip("0-") != ""   # all-zero uuid means nothing loaded
+        elif key == "lnk":
+            c["link"] = val
+
+    out = [cards[k] for k in sorted(cards)]
+
+    # A prototyping board appears twice: once as an unrecognisable PCIe endpoint and
+    # once as a USB bridge that knows the model.  Fold the USB name onto the PCIe
+    # cards we couldn't identify, but only when the counts line up and every board
+    # is the same model — otherwise we'd be guessing, so list them separately.
+    anon = [c for c in out if not c["model"]]
+    same_model = len({b["model"] for b in boards}) == 1
+    if boards and anon and same_model and len(boards) == len(anon):
+        for c, b in zip(anon, boards):
+            c["model"] = b["model"]
+            c["serial"] = b["serial"]
+    elif boards:
+        for b in boards:
+            out.append({
+                "bdf": b["usb_id"], "model": b["model"], "shell": None,
+                "dev_id": None, "driver": None, "temp_c": None, "power_w": None,
+                "link": "usb", "loaded": None, "serial": b["serial"], "alveo": False,
+            })
+    return out
+
+
 def poll_host(host):
     name = host.get("name") or host["hostname"]
     result = {
@@ -105,6 +233,7 @@ def poll_host(host):
         "load15": None,
         "cores": None,
         "uptime_h": None,
+        "fpgas": [],
         "ts": time.time(),
     }
     client = paramiko.SSHClient()
@@ -161,6 +290,7 @@ def poll_host(host):
             "load15": round(load15, 2),
             "cores": cores,
             "uptime_h": round(uptime_s / 3600, 1),
+            "fpgas": _parse_fpgas(blocks[6] if len(blocks) > 6 else ""),
         })
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
@@ -201,6 +331,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        # the dashboard is embedded in this script, so a cached page survives a
+        # restart and silently hides code changes — never let it be cached
+        self.send_header("Cache-Control", "no-store, must-revalidate")
         self.end_headers()
         self.wfile.write(body)
 
@@ -295,6 +428,22 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
   .spark{margin-top:2px;height:34px;width:100%;display:block}
 
+  .fpga{border-top:1px solid var(--line);margin-top:12px;padding-top:10px}
+  .fpga-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px}
+  .fpga-row{display:grid;grid-template-columns:1fr auto;gap:2px 10px;align-items:center;
+            font-family:var(--mono);font-size:11px;margin-bottom:7px}
+  .fpga-row:last-child{margin-bottom:0}
+  .fpga-name{color:var(--ink);font-weight:600;font-size:12px}
+  .fpga-name span{color:var(--ink-faint);font-weight:400;font-size:10px;margin-left:6px}
+  .fpga-num{font-variant-numeric:tabular-nums;white-space:nowrap;text-align:right}
+  .fpga-num em{font-style:normal;color:var(--ink-faint);margin-left:7px}
+  .fpga-bar{grid-column:1/-1;height:4px;background:var(--panel-2);border-radius:3px;overflow:hidden}
+  .fpga-bar > i{display:block;height:100%;border-radius:3px;transition:width .5s ease,background .3s}
+  .tag{font-size:9px;letter-spacing:.1em;text-transform:uppercase;padding:2px 6px;border-radius:4px;margin-left:6px}
+  .tag.on{color:var(--teal);background:rgba(45,212,167,.12)}
+  .tag.off{color:var(--ink-faint);background:rgba(91,102,115,.14)}
+  .tag.warn{color:var(--amber);background:rgba(240,169,42,.12)}
+
   .foot{display:flex;justify-content:space-between;font-family:var(--mono);font-size:11px;
         color:var(--ink-faint);border-top:1px solid var(--line);margin-top:12px;padding-top:9px}
 
@@ -310,6 +459,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div class="meta">
       <span><b id="ok-count">0</b> online</span>
       <span><b id="down-count">0</b> down</span>
+      <span><b id="fpga-count">0</b> FPGA</span>
       <span>refresh <b id="interval">–</b>s</span>
       <span>updated <b id="updated">–</b></span>
     </div>
@@ -365,6 +515,42 @@ function sparkline(vals, color){
   </svg>`;
 }
 
+const fpgaTempColor = t => t>=85 ? "var(--red)" : t>=70 ? "var(--amber)" : "var(--teal)";
+
+function fpgaBlock(h){
+  if(!h.fpgas || !h.fpgas.length) return "";
+  const rows = h.fpgas.map(f => {
+    const model = f.model || (f.dev_id ? "Xilinx "+f.dev_id : "Xilinx");
+    const t = f.temp_c;
+    const col = t==null ? "var(--ink-faint)" : fpgaTempColor(t);
+    let tag;
+    if(f.loaded)              tag = `<span class="tag on">loaded</span>`;
+    else if(f.loaded===false) tag = `<span class="tag off">idle</span>`;
+    // only Alveo cards are expected to have xclmgmt/xocl bound; prototyping boards
+    // (VPK180, S8_40) legitimately run without it, so don't flag those as broken
+    else if(!f.driver && f.alveo) tag = `<span class="tag warn">no driver</span>`;
+    else                      tag = "";
+    const nums = t==null
+      ? `<em>${f.link || "–"}</em>`
+      : `<span style="color:${col}">${t}°C</span>${f.power_w!=null?`<em>${f.power_w} W</em>`:""}`;
+    // temp bar scaled to 0–100 °C; Alveo cards throttle around 85–90 °C
+    const bar = t==null ? "" :
+      `<div class="fpga-bar"><i style="width:${Math.min(100,t)}%;background:${col}"></i></div>`;
+    return `<div class="fpga-row">
+      <div class="fpga-name">${model}${tag}<span>${f.shell || f.serial || f.bdf}</span></div>
+      <div class="fpga-num">${nums}</div>
+      ${bar}
+    </div>`;
+  }).join("");
+  return `<div class="fpga">
+    <div class="fpga-head">
+      <span class="metric-label">FPGA</span>
+      <span class="metric-label">${h.fpgas.length} card${h.fpgas.length>1?"s":""}</span>
+    </div>
+    ${rows}
+  </div>`;
+}
+
 function card(h, hist){
   const st = statusOf(h);
   if(!h.ok){
@@ -402,6 +588,8 @@ function card(h, hist){
       ${sparkline(memHist, barColor(h.mem_pct))}
     </div>
 
+    ${fpgaBlock(h)}
+
     <div class="foot">
       <span>load ${h.load1} / ${h.load5} / ${h.load15}</span>
       <span>up ${h.uptime_h}h</span>
@@ -429,6 +617,7 @@ function render(data){
   const ok = data.hosts.filter(h=>h.ok).length;
   $("#ok-count").textContent = ok;
   $("#down-count").textContent = data.hosts.length - ok;
+  $("#fpga-count").textContent = data.hosts.reduce((n,h)=> n + (h.fpgas?h.fpgas.length:0), 0);
   $("#interval").textContent = data.interval;
   $("#updated").textContent = new Date(data.server_time*1000).toLocaleTimeString();
 }
